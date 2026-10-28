@@ -6,6 +6,7 @@ const LS_M = 'q408.mistakes.v1';
 const MAX_IMPORT_BYTES = 5 * 1024 * 1024;
 const MAX_SEC_LEN = 32;
 const cache = {};
+let summaryCache = null;
 const S = { xzt: {}, dt: {}, ctNotice: null }; // 当前视图状态
 
 const $ = (s, r) => (r || document).querySelector(s);
@@ -20,6 +21,32 @@ function load(subject) {
   return fetch('data/' + encodeURIComponent(subject) + '.json')
     .then(r => { if (!r.ok) throw new Error('加载失败 ' + r.status); return r.json(); })
     .then(d => { cache[subject] = d; return d; });
+}
+function loadSummary() {
+  if (summaryCache) return Promise.resolve(summaryCache);
+  return fetch('data/summary.json')
+    .then(r => { if (!r.ok) throw new Error('加载失败 ' + r.status); return r.json(); })
+    .then(d => {
+      const rows = SUBJECTS.map(s => {
+        const v = d && d[s];
+        if (!v || typeof v.name !== 'string' || !v.name || !Number.isFinite(v.total) || v.total < 0) {
+          throw new Error('统计数据格式错误');
+        }
+        return { key: s, name: v.name, total: v.total };
+      });
+      summaryCache = rows;
+      return rows;
+    });
+}
+function loadOverviewFromData() {
+  return Promise.all(SUBJECTS.map(load)).then(ds => SUBJECTS.map((s, i) => ({
+    key: s,
+    name: ds[i].name,
+    total: Object.values(ds[i].sections).reduce((a, v) => a + v.qs.length, 0)
+  })));
+}
+function loadOverview() {
+  return loadSummary().catch(loadOverviewFromData);
 }
 function getProgress() { try { return JSON.parse(localStorage.getItem(LS_P)) || {}; } catch (e) { return {}; } }
 function setProgress(p) { localStorage.setItem(LS_P, JSON.stringify(p)); }
@@ -114,20 +141,27 @@ window.addEventListener('hashchange', route);
 /* ---------- 首页 ---------- */
 function home() {
   const app = $('#app');
-  Promise.all(SUBJECTS.map(load)).then(ds => {
+  const intro = '<h2 class="page-title">开始刷题</h2><div class="sub">选择科目进入练习；答案需作答或点击后才显示，错题自动进入错题本。</div>';
+  app.innerHTML = intro + '<div class="empty">正在加载科目数据…</div>';
+  loadOverview().then(rows => {
     const p = getProgress();
-    app.innerHTML = '<h2 class="page-title">开始刷题</h2><div class="sub">选择科目进入练习；答案需作答或点击后才显示，错题自动进入错题本。</div><div class="grid">' +
-      SUBJECTS.map((s, i) => {
-        const d = ds[i];
-        const tot = Object.values(d.sections).reduce((a, v) => a + v.qs.length, 0);
-        const done = Object.values(p[s] || {}).reduce((a, sec) => a + Object.keys(sec).length, 0);
-        const ok = Object.values(p[s] || {}).reduce((a, sec) => a + Object.values(sec).filter(q => q.ok).length, 0);
+    app.innerHTML = intro + '<div class="grid">' +
+      rows.map(r => {
+        const done = Object.values(p[r.key] || {}).reduce((a, sec) => a + Object.keys(sec).length, 0);
+        const ok = Object.values(p[r.key] || {}).reduce((a, sec) => a + Object.values(sec).filter(q => q.ok).length, 0);
         const pct = done ? Math.round(ok / done * 100) : 0;
-        return '<div class="card" onclick="location.hash=\'#/xzt\';S.xzt.subject=\'' + s + '\'">' +
-          '<h3>' + esc(d.name) + '</h3><div class="stat">共 ' + tot + ' 题 · 已做 ' + done + ' · 正确率 ' + pct + '%</div>' +
+        return '<div class="card" data-subject="' + esc(r.key) + '">' +
+          '<h3>' + esc(r.name) + '</h3><div class="stat">共 ' + r.total + ' 题 · 已做 ' + done + ' · 正确率 ' + pct + '%</div>' +
           '<div class="bar"><i style="width:' + pct + '%"></i></div></div>';
       }).join('') + '</div>';
-  }).catch(e => app.innerHTML = '<div class="empty">数据加载失败：' + esc(e.message) + '</div>');
+    $$('#app .card').forEach(card => {
+      card.onclick = () => { S.xzt.subject = card.dataset.subject; location.hash = '#/xzt'; };
+    });
+  }).catch(e => {
+    app.innerHTML = intro + '<div class="empty">数据加载失败：' + esc(e.message) + ' <button class="btn" id="home-retry">重试</button></div>';
+    const retry = $('#home-retry');
+    if (retry) retry.onclick = home;
+  });
 }
 
 /* ---------- 选择题 ---------- */
@@ -383,22 +417,26 @@ function bindCtActions() {
 function viewStats() {
   updateBadge();
   const app = $('#app');
-  app.innerHTML = '<h2 class="page-title">学习统计</h2>';
-  Promise.all(SUBJECTS.map(load)).then(ds => {
+  const title = '<h2 class="page-title">学习统计</h2>';
+  app.innerHTML = title + '<div class="empty">正在加载统计数据…</div>';
+  loadOverview().then(rows => {
     const p = getProgress();
     let tDone = 0, tOk = 0, tTot = 0;
-    const rows = SUBJECTS.map((s, i) => {
-      const d = ds[i];
-      const tot = Object.values(d.sections).reduce((a, v) => a + v.qs.length, 0);
-      const done = Object.values(p[s] || {}).reduce((a, sec) => a + Object.keys(sec).length, 0);
-      const ok = Object.values(p[s] || {}).reduce((a, sec) => a + Object.values(sec).filter(q => q.ok).length, 0);
-      tDone += done; tOk += ok; tTot += tot;
+    const rowHtml = rows.map(r => {
+      const done = Object.values(p[r.key] || {}).reduce((a, sec) => a + Object.keys(sec).length, 0);
+      const ok = Object.values(p[r.key] || {}).reduce((a, sec) => a + Object.values(sec).filter(q => q.ok).length, 0);
+      tDone += done; tOk += ok; tTot += r.total;
       const pct = done ? Math.round(ok / done * 100) : 0;
-      return '<div class="panel"><h3>' + esc(d.name) + '</h3><div>总题数 ' + tot + ' · 已做 ' + done + ' · 答对 ' + ok + ' · 正确率 <b>' + pct + '%</b></div>' +
+      return '<div class="panel"><h3>' + esc(r.name) + '</h3><div>总题数 ' + r.total + ' · 已做 ' + done + ' · 答对 ' + ok + ' · 正确率 <b>' + pct + '%</b></div>' +
         '<div class="bar"><i style="width:' + pct + '%"></i></div></div>';
     }).join('');
     const all = tDone ? Math.round(tOk / tDone * 100) : 0;
-    app.innerHTML += '<div class="panel"><h3>总计</h3><div>总题数 ' + tTot + ' · 已做 ' + tDone + ' · 正确率 <b>' + all + '%</b> · 错题 ' + getMistakes().length + '</div></div>' + rows;
+    app.innerHTML = title +
+      '<div class="panel"><h3>总计</h3><div>总题数 ' + tTot + ' · 已做 ' + tDone + ' · 正确率 <b>' + all + '%</b> · 错题 ' + getMistakes().length + '</div></div>' + rowHtml;
+  }).catch(e => {
+    app.innerHTML = title + '<div class="empty">数据加载失败：' + esc(e.message) + ' <button class="btn" id="stats-retry">重试</button></div>';
+    const retry = $('#stats-retry');
+    if (retry) retry.onclick = viewStats;
   });
 }
 
