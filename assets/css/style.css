@@ -85,6 +85,8 @@ select:focus,input:focus{outline:2px solid var(--acc-soft)}
 .mistake .body{display:none;margin-top:8px;font-size:14px;white-space:pre-wrap}
 .mistake.open .body{display:block}
 .warn{background:var(--warn-soft);border:1px solid var(--warn);color:var(--warn);border-radius:10px;padding:10px 12px;font-size:13px;margin:10px 0}
+.notice{background:var(--ok-soft);border:1px solid var(--ok);color:var(--ok);border-radius:10px;padding:10px 12px;font-size:13px;margin:10px 0}
+.notice.bad{background:var(--bad-soft);border-color:var(--bad);color:var(--bad)}
 .hint-line{color:var(--sub);font-size:13px;margin:6px 0}
 .dim{color:var(--sub)}
 .small{font-size:12px;color:var(--sub)}

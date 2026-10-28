@@ -3,8 +3,10 @@
 const SUBJECTS = ['数据结构', '操作系统', '计组', '计网'];
 const LS_P = 'q408.progress.v1';
 const LS_M = 'q408.mistakes.v1';
+const MAX_IMPORT_BYTES = 5 * 1024 * 1024;
+const MAX_SEC_LEN = 32;
 const cache = {};
-const S = { xzt: {}, dt: {} }; // 当前视图状态
+const S = { xzt: {}, dt: {}, ctNotice: null }; // 当前视图状态
 
 const $ = (s, r) => (r || document).querySelector(s);
 const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
@@ -21,14 +23,83 @@ function load(subject) {
 }
 function getProgress() { try { return JSON.parse(localStorage.getItem(LS_P)) || {}; } catch (e) { return {}; } }
 function setProgress(p) { localStorage.setItem(LS_P, JSON.stringify(p)); }
-function getMistakes() { try { return JSON.parse(localStorage.getItem(LS_M)) || []; } catch (e) { return []; } }
+function getMistakes() {
+  try { const v = JSON.parse(localStorage.getItem(LS_M)); return Array.isArray(v) ? v : []; }
+  catch (e) { return []; }
+}
 function setMistakes(m) { localStorage.setItem(LS_M, JSON.stringify(m)); updateBadge(); }
+function mistakeKey(m) { return m.subject + '\u0000' + m.sec + '\u0000' + m.num; }
+function normalizeMistake(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const subject = typeof raw.subject === 'string' ? raw.subject.trim() : '';
+  const sec = raw.sec == null ? '' : String(raw.sec).trim();
+  const num = Number(raw.num);
+  const ts = Number(raw.ts);
+  if (!SUBJECTS.includes(subject) || !sec || sec.length > MAX_SEC_LEN) return null;
+  if (!Number.isSafeInteger(num) || num <= 0) return null;
+  return {
+    subject, sec, num,
+    mine: raw.mine == null ? '' : String(raw.mine),
+    right: raw.right == null ? '' : String(raw.right),
+    ts: Number.isFinite(ts) && ts > 0 && ts <= 8640000000000000 ? ts : 0
+  };
+}
+function parseMistakeFile(text) {
+  let raw;
+  try { raw = JSON.parse(String(text == null ? '' : text).replace(/^\uFEFF/, '')); }
+  catch (e) { throw new Error('不是有效的 JSON 文件'); }
+  if (!Array.isArray(raw)) throw new Error('文件格式不正确（应为导出生成的 JSON 数组）');
+  const map = new Map();
+  let skipped = 0, duplicates = 0;
+  raw.forEach(item => {
+    const m = normalizeMistake(item);
+    if (!m) { skipped++; return; }
+    const k = mistakeKey(m);
+    const prev = map.get(k);
+    if (!prev) { map.set(k, m); return; }
+    duplicates++;
+    if (m.ts > prev.ts) map.set(k, m);
+  });
+  return { list: Array.from(map.values()), skipped, duplicates };
+}
+function mergeMistakes(existing, incoming) {
+  const map = new Map();
+  (Array.isArray(existing) ? existing : []).forEach(item => {
+    const m = normalizeMistake(item);
+    if (!m) return;
+    const k = mistakeKey(m);
+    const prev = map.get(k);
+    if (!prev || m.ts > prev.ts) map.set(k, m);
+  });
+  let added = 0, updated = 0, kept = 0;
+  incoming.forEach(m => {
+    const k = mistakeKey(m);
+    const prev = map.get(k);
+    if (!prev) { map.set(k, m); added++; }
+    else if (m.ts > prev.ts) { map.set(k, m); updated++; }
+    else kept++;
+  });
+  const merged = Array.from(map.values()).sort((a, b) => a.ts - b.ts);
+  return { merged, added, updated, kept };
+}
+function importNoticeText(res, parsed) {
+  const parts = ['新增 ' + res.added + ' 条'];
+  if (res.updated) parts.push('更新 ' + res.updated + ' 条');
+  if (res.kept) parts.push('保留本机较新 ' + res.kept + ' 条');
+  if (parsed.skipped) parts.push('跳过无效 ' + parsed.skipped + ' 条');
+  if (parsed.duplicates) parts.push('合并文件内重复 ' + parsed.duplicates + ' 条');
+  return '导入完成：' + parts.join('，') + '。当前共 ' + res.merged.length + ' 条错题。';
+}
 function updateBadge() {
   const b = $('#ct-badge'); if (!b) return;
   const n = getMistakes().length;
   b.textContent = n; b.classList.toggle('hidden', !n);
 }
-function fmtDate(ts) { const d = new Date(ts); return d.getMonth() + 1 + '月' + d.getDate() + '日 ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
+function fmtDate(ts) {
+  const d = new Date(ts);
+  if (!ts || isNaN(d.getTime())) return '时间未知';
+  return d.getMonth() + 1 + '月' + d.getDate() + '日 ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
 
 /* ---------- 导航 ---------- */
 const routes = { '': home, xzt: viewXzt, dt: viewDt, ct: viewCt, stats: viewStats };
@@ -227,9 +298,19 @@ function viewCt() {
   updateBadge();
   const app = $('#app');
   const ms = getMistakes();
-  app.innerHTML = '<h2 class="page-title">错题本</h2><div class="sub">答错的选择题自动记录在此（存于本机浏览器）。</div>' +
-    '<div class="act-row"><button class="btn" id="m-exp">导出 JSON</button><button class="btn" id="m-clr">清空错题本</button></div>';
-  if (!ms.length) { app.insertAdjacentHTML('beforeend', '<div class="empty">暂无错题记录，继续刷题吧～</div>'); bindClear(); return; }
+  const notice = S.ctNotice;
+  S.ctNotice = null;
+  app.innerHTML = '<h2 class="page-title">错题本</h2>' +
+    '<div class="sub">答错的选择题自动记录在此（存于本机浏览器）。可用「导出 JSON / 导入 JSON」在设备间迁移记录；导入会与本机记录合并，同一题保留较新的一条。</div>' +
+    '<div class="act-row">' +
+    '<button class="btn" id="m-exp">导出 JSON</button>' +
+    '<button class="btn" id="m-imp">导入 JSON</button>' +
+    '<input type="file" id="m-file" accept=".json,application/json" hidden>' +
+    '<button class="btn" id="m-clr">清空错题本</button>' +
+    '</div>' +
+    (notice ? '<div class="notice' + (notice.bad ? ' bad' : '') + '">' + esc(notice.text) + '</div>' : '');
+  bindCtActions();
+  if (!ms.length) { app.insertAdjacentHTML('beforeend', '<div class="empty">暂无错题记录，继续刷题吧～</div>'); return; }
   const list = document.createElement('div');
   list.className = 'list';
   ms.slice().reverse().forEach(m => {
@@ -238,7 +319,7 @@ function viewCt() {
     item.innerHTML = '<div class="head"><div><b>' + esc(m.subject) + ' ' + esc(m.sec) + ' 第' + m.num + '题</b>' +
       '<div class="meta">' + fmtDate(m.ts) + ' · 我的答案 ' + esc(m.mine) + ' / 正确答案 ' + esc(m.right) + '</div></div>' +
       '<div><button class="btn small" data-a="view">解析</button> <button class="btn small" data-a="del">删除</button></div></div>' +
-      '<div class="body" id="m-body-' + m.subject + '-' + m.sec + '-' + m.num + '">加载中…</div>';
+      '<div class="body">加载中…</div>';
     item.querySelector('[data-a=del]').onclick = () => { setMistakes(getMistakes().filter(x => !(x.subject === m.subject && x.sec === m.sec && x.num === m.num))); viewCt(); };
     item.querySelector('[data-a=view]').onclick = () => {
       item.classList.toggle('open');
@@ -257,16 +338,45 @@ function viewCt() {
     list.appendChild(item);
   });
   app.appendChild(list);
-  bindClear();
-  $('#m-exp').onclick = () => {
-    const blob = new Blob([JSON.stringify(ms, null, 2)], { type: 'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob); a.download = '408-错题本.json'; a.click();
-  };
 }
-function bindClear() {
-  const b = $('#m-clr'); if (!b) return;
-  b.onclick = () => { if (confirm('确定清空错题本？')) { setMistakes([]); viewCt(); } };
+function showCtNotice(text, bad) {
+  S.ctNotice = { text: text, bad: !!bad };
+  if (location.hash.replace(/^#\/?/, '') === 'ct') viewCt();
+}
+function exportMistakes() {
+  const blob = new Blob([JSON.stringify(getMistakes(), null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = '408-错题本.json'; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+function importMistakesFile(file) {
+  if (!file) return;
+  if (file.size > MAX_IMPORT_BYTES) { showCtNotice('导入失败：文件超过 5 MB。', true); return; }
+  file.text().then(text => {
+    let parsed;
+    try { parsed = parseMistakeFile(text); }
+    catch (e) { showCtNotice('导入失败：' + e.message + '。', true); return; }
+    if (!parsed.list.length) {
+      showCtNotice('导入失败：文件中没有有效的错题记录' + (parsed.skipped ? '（跳过无效 ' + parsed.skipped + ' 条）' : '') + '。', true);
+      return;
+    }
+    const res = mergeMistakes(getMistakes(), parsed.list);
+    try { setMistakes(res.merged); }
+    catch (e) { showCtNotice('导入失败：无法写入本机存储（空间不足或浏览器限制）。', true); return; }
+    showCtNotice(importNoticeText(res, parsed), false);
+  }).catch(() => showCtNotice('导入失败：无法读取文件。', true));
+}
+function bindCtActions() {
+  const exp = $('#m-exp');
+  if (exp) exp.onclick = exportMistakes;
+  const clr = $('#m-clr');
+  if (clr) clr.onclick = () => { if (confirm('确定清空错题本？')) { setMistakes([]); viewCt(); } };
+  const imp = $('#m-imp'), file = $('#m-file');
+  if (imp && file) imp.onclick = () => file.click();
+  if (file) file.onchange = () => {
+    const f = file.files && file.files[0];
+    if (f) importMistakesFile(f);
+  };
 }
 
 /* ---------- 统计 ---------- */
@@ -299,15 +409,15 @@ function mark(subject, sec, num, mine, ok) {
   if (!p[subject][sec]) p[subject][sec] = {};
   p[subject][sec][num] = { mine, ok, ts: Date.now() };
   setProgress(p);
-  const ms = getMistakes();
   if (!ok) {
     load(subject).then(d => {
       const q = d.sections[sec] && d.sections[sec].qs.find(x => x[0] === num);
+      const ms = getMistakes().filter(x => !(x.subject === subject && x.sec === sec && x.num === num));
       ms.push({ subject, sec, num, mine, right: q ? q[1] : '?', ts: Date.now() });
       setMistakes(ms);
     });
   } else {
-    setMistakes(ms.filter(x => !(x.subject === subject && x.sec === sec && x.num === num)));
+    setMistakes(getMistakes().filter(x => !(x.subject === subject && x.sec === sec && x.num === num)));
   }
 }
 
